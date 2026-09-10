@@ -1,0 +1,436 @@
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+import { getAuth,onAuthStateChanged,GoogleAuthProvider,signInWithPopup,signOut } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+import { getFirestore,doc,getDoc,setDoc,updateDoc,addDoc,collection,query,orderBy,getDocs,runTransaction,serverTimestamp,arrayUnion,arrayRemove,deleteDoc,onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { firebaseConfig } from "./firebase-config.js";
+
+const app=initializeApp(firebaseConfig),auth=getAuth(app),db=getFirestore(app),provider=new GoogleAuthProvider();
+const DAYS=["Thứ 2","Thứ 3","Thứ 4","Thứ 5","Thứ 6","Thứ 7"];
+const PERIODS=[
+ ["Sáng - Tiết 1","06:55","07:40","Sáng","1"],["Sáng - Tiết 2","07:45","08:30","Sáng","2"],["Sáng - Tiết 3","08:55","09:40","Sáng","3"],["Sáng - Tiết 4","09:45","10:30","Sáng","4"],["Sáng - Tiết 5","10:35","11:20","Sáng","5"],
+ ["Chiều - Tiết 1","13:40","14:25","Chiều","1"],["Chiều - Tiết 2","14:25","15:10","Chiều","2"],["Chiều - Tiết 3","15:15","16:00","Chiều","3"],["Chiều - Tiết 4","16:00","16:45","Chiều","4"]
+];
+const SUBJECTS=["Toán","Ngữ văn","Tiếng Anh","Vật lý","Hóa học","Sinh học","Lịch sử","Thể dục","GDQP","HDTN","KTPL"];
+let notificationTimer=null,notificationLastSnapshot="",notificationPanelOpen=false,taskDialogReturnFocus=null,lastDefaultDeadline="",lastCompletionUndo=null,tomorrowTaskFocusPending=false,appLoaderTimeout=null,taskSnapshotResolve=null,taskSnapshotPromise=null;
+let user=null,profile=null,weekStart=monday(new Date()),tasks=[],users=[],view="board",period="current",statusFilter="all",searchTimer=null,currentSchedule={},taskSchedule={},unsubs=[],scheduleUnsub=null,scheduleListenerKey=null,scheduleRenderToken=0,scheduleDirty=false,tasksLoaded=false,mobileDayIndex=Math.max(0,Math.min(5,new Date().getDay()-1));
+
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+function hideAppLoader(){const el=$("#appLoader");if(!el)return;clearTimeout(appLoaderTimeout);el.classList.add("fade-out");setTimeout(()=>{el.style.display="none"},400)}
+appLoaderTimeout=setTimeout(hideAppLoader,8000);
+const iso=d=>{const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),day=String(d.getDate()).padStart(2,"0");return `${y}-${m}-${day}`};
+function localDate(s){const [y,m,d]=s.split("-").map(Number);return new Date(y,m-1,d)}
+function monday(d){const x=new Date(d);x.setHours(0,0,0,0);const n=x.getDay();x.setDate(x.getDate()+(n===0?-6:1-n));return x}
+function escape(v=""){return String(v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]))}
+function showAuthError(msg){const e=$("#authErr");if(e){e.textContent=msg;e.classList.remove("hidden")}}
+function clearAuthError(){const e=$("#authErr");if(e){e.textContent="";e.classList.add("hidden")}}
+function toast(msg,options={}){const e=$("#toast");if(!e)return;clearTimeout(e._t);e.innerHTML=`<span>${escape(msg)}</span>${options.actionText?`<button type="button" class="toast-action">${escape(options.actionText)}</button>`:""}`;e.classList.add("show");const a=e.querySelector(".toast-action");if(a)a.onclick=async()=>{a.disabled=true;try{await options.onAction?.()}catch(x){toast(errorMessage(x))}finally{e.classList.remove("show")}};e._t=setTimeout(()=>e.classList.remove("show"),options.duration||2600)}
+function notificationKey(t,kind="soon"){return `${t.id}:${kind}:${t.deadline||t.date}`}
+function taskDeadlineDate(t){const d=t?.deadline?new Date(t.deadline):localDate(t?.date||iso(new Date()));return Number.isNaN(d.getTime())?localDate(t?.date||iso(new Date())):d}
+function taskTimeLabel(t){const diff=taskDeadlineDate(t)-Date.now(),abs=Math.abs(diff);if(diff<0){const h=Math.floor(abs/3600000),m=Math.floor((abs%3600000)/60000);return h>=24?`Quá hạn ${Math.floor(h/24)} ngày`:h?`Quá hạn ${h} giờ`:`Quá hạn ${Math.max(1,m)} phút`}if(diff<3600000)return `Còn ${Math.max(1,Math.floor(diff/60000))} phút`;if(diff<86400000)return `Còn ${Math.floor(diff/3600000)} giờ`;if(diff<172800000)return "Ngày mai";return `Còn ${Math.ceil(diff/86400000)} ngày`}
+function upcomingTasks(){const now=Date.now(),limit=now+7*86400000;return tasks.filter(t=>t.status!=="completed"||!(t.completedBy||[]).includes(user?.uid)).filter(t=>{const d=taskDeadlineDate(t).getTime();return d>=now-86400000&&d<=limit}).sort((a,b)=>taskDeadlineDate(a)-taskDeadlineDate(b))}
+function renderNotificationPanel(){const list=$("#notificationList"),badge=$("#notificationBadge"),summary=$("#notificationSummary");if(!list)return;const items=upcomingTasks();if(badge){badge.textContent=Math.min(items.length,99);badge.classList.toggle("hidden",!items.length)}if(summary)summary.textContent=items.length?`${items.length} nhiệm vụ trong 7 ngày tới`:"Không có nhiệm vụ sắp tới";list.innerHTML=items.length?items.map(t=>{const d=taskDeadlineDate(t),urgent=d-Date.now()<=86400000;return `<button class="notification-item ${urgent?"urgent":""}" data-notification-task="${escape(t.id)}" type="button"><span class="notification-icon">${urgent?"⏰":"📚"}</span><span class="notification-content"><strong>${escape(t.taskContent||"Nhiệm vụ")}</strong><small>${escape(t.subject||"")} · ${taskTimeLabel(t)} · ${d.toLocaleString("vi-VN",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})}</small></span></button>`}).join(""): `<div class="notification-empty"><span>✨</span><strong>Không có nhiệm vụ sắp tới</strong><small>Những nhiệm vụ trong 7 ngày tới sẽ xuất hiện ở đây.</small></div>`}
+function showTaskAlert(t){const e=$("#taskAlert");if(!e)return;const d=taskDeadlineDate(t),urgent=d-Date.now()<=86400000;e.innerHTML=`<div class="task-alert-icon">${urgent?"⏰":"🔔"}</div><div class="task-alert-body"><strong>Nhiệm vụ sắp tới</strong><span>${escape(t.taskContent||"Nhiệm vụ")} · ${escape(t.subject||"")}</span><small>${taskTimeLabel(t)} · hạn ${d.toLocaleString("vi-VN",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})}</small></div><button class="task-alert-close" type="button" aria-label="Đóng">×</button>`;e.classList.add("show");e.setAttribute("aria-hidden","false");clearTimeout(e._t);e._t=setTimeout(hideTaskAlert,7000);e.querySelector(".task-alert-close")?.addEventListener("click",hideTaskAlert,{once:true})}
+function hideTaskAlert(){const e=$("#taskAlert");if(!e)return;e.classList.remove("show");e.setAttribute("aria-hidden","true")}
+function browserNotify(t){if(!("Notification"in window)||Notification.permission!=="granted")return;const d=taskDeadlineDate(t);new Notification(`🔔 ${taskTimeLabel(t)}: ${t.subject||"Nhiệm vụ"}`,{body:`${t.taskContent||"Có nhiệm vụ sắp tới"} · Hạn ${d.toLocaleString("vi-VN",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})}`,tag:`schooltask-${t.id}`})}
+function checkUpcomingNotifications(force=false){if(!user)return;renderNotificationPanel();const items=upcomingTasks(),snapshot=items.map(t=>`${t.id}:${t.deadline}:${t.taskContent}`).join("|");if(!force&&snapshot===notificationLastSnapshot)return;notificationLastSnapshot=snapshot;items.forEach(t=>{const d=taskDeadlineDate(t),hours=(d-Date.now())/3600000;if(hours<0||hours>168)return;const key=notificationKey(t,"popup"),shown=localStorage.getItem(`schooltask-notify:${key}`);if(shown)return;localStorage.setItem(`schooltask-notify:${key}`,String(Date.now()));showTaskAlert(t);browserNotify(t)})}
+async function enableDesktopNotifications(){if(!("Notification"in window)){toast("Trình duyệt này không hỗ trợ thông báo màn hình.");return}const permission=await Notification.requestPermission();if(permission==="granted"){toast("✓ Đã bật thông báo màn hình");$("#enableDesktopNotifications").innerHTML='<i class="fa-solid fa-bell"></i> Đã bật thông báo màn hình';checkUpcomingNotifications(true)}else toast("Bạn chưa cấp quyền thông báo màn hình.")}
+function openNotifications(){notificationPanelOpen=true;$("#notificationPanel")?.classList.add("show");$("#notificationPanel")?.setAttribute("aria-hidden","false");renderNotificationPanel()}
+function closeNotifications(){notificationPanelOpen=false;$("#notificationPanel")?.classList.remove("show");$("#notificationPanel")?.setAttribute("aria-hidden","true")}
+function setSyncStatus(kind="online",text="Đang đồng bộ"){
+ const el=$("#syncStatus"); if(!el)return;
+ el.className=`sync-status ${kind}`;
+ const icons={online:"fa-wifi",saving:"fa-rotate fa-spin",error:"fa-triangle-exclamation",offline:"fa-cloud"};
+ el.innerHTML=`<i class="fa-solid ${icons[kind]||icons.online}"></i> ${escape(text)}`;
+}
+function updateOnlineStatus(){setSyncStatus(navigator.onLine?"online":"offline",navigator.onLine?"Đang đồng bộ":"Ngoại tuyến");}
+
+function errorMessage(e){const c=e?.code||"";const map={"auth/popup-closed-by-user":"Bạn đã đóng cửa sổ đăng nhập.","auth/popup-blocked":"Trình duyệt đã chặn cửa sổ đăng nhập. Hãy cho phép popup rồi thử lại.","auth/cancelled-popup-request":"Yêu cầu đăng nhập đã bị hủy.","auth/unauthorized-domain":"Tên miền hiện tại chưa được thêm vào Authorized domains của Firebase.","auth/operation-not-allowed":"Đăng nhập Google chưa được bật trong Firebase Authentication.","auth/network-request-failed":"Không thể kết nối Firebase. Kiểm tra mạng rồi thử lại.","permission-denied":"Bạn không có quyền thực hiện thao tác này."};return map[c]||e?.message||"Có lỗi xảy ra. Vui lòng thử lại."}
+function initials(n="HS"){return n.trim().split(/\s+/).slice(-2).map(x=>x[0]).join("").toUpperCase()||"HS"}
+function periodByKey(key){return PERIODS.find(p=>p[0]===key)}
+function dayFromDate(date){const n=localDate(date).getDay();return n===0?"":DAYS[n-1]}
+function weekKeyForDate(date){return iso(monday(localDate(date)))}
+
+function subjectOptions(selected="",subjects=SUBJECTS){
+ const list=[...new Set(subjects.filter(Boolean))];
+ if(selected&&!list.includes(selected))list.unshift(selected);
+ return list.map(s=>`<option value="${escape(s)}" ${s===selected?"selected":""}>${escape(s)}</option>`).join("");
+}
+
+function sharedScheduleRef(){ return doc(db,"schedules",iso(weekStart)); }
+function sharedScheduleRefFor(date){ return doc(db,"schedules",weekKeyForDate(date)); }
+function scheduleForCurrentWeek(){ return currentSchedule||{}; }
+
+function subjectColor(subject=""){
+ let h=0; for(const c of subject)h=(h*31+c.charCodeAt(0))%360;
+ return `hsl(${h} 72% 42%)`;
+}
+function formatDeadline(t){const d=taskDeadlineDate(t);return d.toLocaleString("vi-VN",{hour:"2-digit",minute:"2-digit",day:"2-digit",month:"2-digit"})}
+function deadlineClass(t){const diff=taskDeadlineDate(t)-Date.now();return diff<0?"deadline-overdue":diff<=86400000?"deadline-urgent":""}
+function highlightText(value,q){const safe=escape(value||"");const needle=escape(q.trim());if(!needle)return safe;const pattern=needle.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");return safe.replace(new RegExp(`(${pattern})`,"gi"),"<mark>$1</mark>")}
+function updateTaskBadge(){const badge=$("#taskBadge");if(!badge||!user)return;const n=tasks.filter(t=>!(t.completedBy||[]).includes(user.uid)&&taskDeadlineDate(t).getTime()>=Date.now()).length;badge.textContent=Math.min(n,99);badge.classList.toggle("hidden",!n)}
+function syncQuickUserChips(){const uf=$("#userFilter")?.value||"all";$$('[data-user-quick]').forEach(b=>b.classList.toggle("active",b.dataset.userQuick===(uf===user?.uid?"self":uf)))}
+function updateTaskDialogState(subjectCount=0){const note=$("#taskScheduleNote"),submit=$("#saveTaskBtn"),empty=subjectCount===0;if(note){note.classList.toggle("hidden",!empty);note.innerHTML=empty?`<i class="fa-solid fa-triangle-exclamation"></i> Thời khóa biểu tuần này chưa có môn. Vào tab Thời khóa biểu điền trước khi tạo nhiệm vụ.`:""}if(submit)submit.disabled=empty}
+function scheduleHasDayData(schedule,day){return Object.values(schedule?.[day]||{}).some(Boolean)}
+function defaultDeadlineForDate(date){const d=localDate(date);d.setDate(d.getDate()+1);return `${iso(d)}T23:59`}
+function scheduleSelect(date,day,p,extra=""){
+ const value=currentSchedule[day]?.[p[0]]||"";
+ return `<select class="schedule-input" data-day="${escape(day)}" data-period="${escape(p[0])}" aria-label="${escape(day)} ${escape(p[0])}"><option value="">— Chọn môn —</option>${subjectOptions(value)}</select>`;
+}
+function renderMobileSchedule(){
+ const day=DAYS[mobileDayIndex]||DAYS[0],date=iso(new Date(weekStart.getTime()+mobileDayIndex*86400000));
+ const row=currentSchedule[day]||{};
+ const selector=$("#mobileDaySelector");
+ if(selector)selector.innerHTML=DAYS.map((d,i)=>`<button class="day-chip ${i===mobileDayIndex?"active":""}" data-mobile-day="${i}"><b>${d.replace("Thứ ","T")}</b><small>${new Date(weekStart.getTime()+i*86400000).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit"})}</small></button>`).join("");
+ const area=$("#mobileSchedule");
+ if(!area)return;
+ area.innerHTML=`<div class="mobile-day-title"><div><span>${day}</span><strong>${localDate(date).toLocaleDateString("vi-VN",{weekday:"long",day:"2-digit",month:"2-digit"})}</strong></div><span>${Object.values(row).filter(Boolean).length}/9 tiết có môn</span></div>`+
+ PERIODS.map(p=>{const subject=row[p[0]]||"";return `<article class="period-card ${p[3]==="Sáng"?"morning":"afternoon"}" style="--subject-color:${subjectColor(subject)}"><div class="period-number"><span>${p[3]==="Sáng"?"☀️":"🌙"}</span><b>Tiết ${p[4]}</b><small>${p[1]}–${p[2]}</small></div><div class="period-subject">${scheduleSelect(date,day,p)}</div><div class="period-task"><select class="schedule-task-select" data-task-date="${date}" data-task-period="${escape(p[0])}" aria-label="Nhiệm vụ ${escape(day)} ${escape(p[0])}"><option value="">📋 Nhiệm vụ</option></select></div></article>`}).join("");
+}
+function prepareEveningScheduleView(){const h=new Date().getHours();if(h<18)return;const n=new Date();n.setDate(n.getDate()+1);const dow=n.getDay();if(dow===0||dow===6){weekStart=monday(n);mobileDayIndex=0}else{weekStart=monday(n);mobileDayIndex=dow-1}}
+function renderSchedule(){
+ const weekKey=iso(weekStart),renderToken=++scheduleRenderToken;
+ unsubscribeScheduleRealtime(); currentSchedule={};
+ const end=new Date(weekStart.getTime()+6*86400000);
+ $("#weekText").textContent=`${weekStart.toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit"})} – ${end.toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric"})}`;
+ const now=new Date(),todayKey=iso(now),tomorrowDate=new Date(now);tomorrowDate.setDate(tomorrowDate.getDate()+1);const tomorrowKey=iso(tomorrowDate),isSunday=now.getDay()===0;
+ const head=`<thead><tr><th rowspan="2" class="day-col">Thứ</th><th colspan="5" class="session morning">☀️ Sáng</th><th colspan="4" class="session afternoon">🌙 Chiều</th></tr><tr>${PERIODS.map(p=>`<th class="period-head ${p[3]==="Sáng"?"morning":"afternoon"}">Tiết ${p[4]}<small>${p[1]}–${p[2]}</small></th>`).join("")}</tr></thead>`;
+ const body=`<tbody>${DAYS.map((d,di)=>{const date=iso(new Date(weekStart.getTime()+di*86400000)),todayClass=!isSunday&&date===todayKey?" today-col":isSunday&&date===tomorrowKey?" tomorrow-col":"",tomorrowClass=!isSunday&&date===tomorrowKey?" tomorrow-col":"";return `<tr><th class="day-name${todayClass}${tomorrowClass}">${d}<small>${new Date(weekStart.getTime()+di*86400000).toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit"})}</small></th>${PERIODS.map(p=>`<td class="schedule-cell${todayClass}${tomorrowClass}" data-date="${date}" data-day="${d}" data-period="${p[0]}">${scheduleSelect(date,d,p)}<select class="schedule-task-select" data-task-date="${date}" data-task-period="${p[0]}" aria-label="Nhiệm vụ ${d} ${p[0]}"><option value="">📋 Nhiệm vụ</option></select></td>`).join("")}</tr>`}).join("")}</tbody>`;
+ $("#scheduleTable").innerHTML=head+body; applyScheduleToUI();
+}
+
+function applyScheduleToUI(){
+ $$(".schedule-input").forEach(e=>e.value=currentSchedule[e.dataset.day]?.[e.dataset.period]||"");
+ renderMobileSchedule();
+ renderScheduleTaskDropdowns();
+}
+
+function subscribeScheduleRealtime(expectedWeekKey=iso(weekStart),renderToken=scheduleRenderToken){
+ unsubscribeScheduleRealtime();
+ if(!user)return;
+ const ref=doc(db,"schedules",expectedWeekKey);
+ scheduleListenerKey=expectedWeekKey;
+ let first=true,lastUpdatedAt=null;
+ scheduleUnsub=onSnapshot(ref,snap=>{
+   if(!user || scheduleListenerKey!==expectedWeekKey || renderToken!==scheduleRenderToken)return;
+   const incoming=snap.exists()?(snap.data().schedule||{}):{},updated=snap.data()?.updatedAt?.toMillis?.()||null,wasFirst=first;
+   first=false;currentSchedule=incoming;applyScheduleToUI();setSyncStatus("online","Đang đồng bộ");
+   if(wasFirst)switchTab("tasks");
+   if(!wasFirst&&snap.exists()&&snap.metadata?.hasPendingWrites===false&&updated!==null&&updated!==lastUpdatedAt)toast("🔄 TKB vừa được cập nhật");
+   if(updated!==null)lastUpdatedAt=updated;
+   syncTaskDropdown().catch(e=>console.warn("sync task dropdown after schedule update:",e));
+ },e=>{
+   if(scheduleListenerKey!==expectedWeekKey || renderToken!==scheduleRenderToken)return;
+   console.error("schedule listener",e);setSyncStatus("error","Lỗi đồng bộ");toast(`Không thể đồng bộ TKB: ${errorMessage(e)}`);
+ });
+}
+
+function unsubscribeScheduleRealtime(){
+ if(scheduleUnsub){ try{scheduleUnsub()}catch(e){console.warn("unsubscribe schedule failed",e)} scheduleUnsub=null; }
+ scheduleListenerKey=null;
+}
+
+function syncScheduleInputGroup(source){
+ const day=source?.dataset?.day, period=source?.dataset?.period;
+ if(!day||!period)return;
+ const value=source.value||"";
+ scheduleDirty=true;
+ $$(`.schedule-input[data-day="${CSS.escape(day)}"][data-period="${CSS.escape(period)}"]`).forEach(input=>{
+   if(input!==source && input.value!==value)input.value=value;
+ });
+ currentSchedule[day]??={};
+ currentSchedule[day][period]=value;
+ renderScheduleTaskDropdowns();
+}
+
+function collectScheduleFromUI(){
+ const schedule={};
+ DAYS.forEach(d=>{
+   schedule[d]={};
+   PERIODS.forEach(p=>{
+     const inputs=$$(`.schedule-input[data-day="${CSS.escape(d)}"][data-period="${CSS.escape(p[0])}"]`);
+     // Desktop and mobile render the same cell. The change handler keeps them
+     // mirrored, so the first value is enough; fall back to any non-empty value.
+     schedule[d][p[0]]=inputs.find(x=>x.value)?.value||inputs[0]?.value||"";
+   });
+ });
+ return schedule;
+}
+
+async function saveSchedule(){
+ if(!user){
+   toast("Bạn chưa đăng nhập. Hãy đăng nhập rồi lưu thời khóa biểu.");
+   throw new Error("Bạn chưa đăng nhập. Hãy đăng nhập rồi lưu thời khóa biểu.");
+ }
+ const uid=user.uid;
+ const weekKey=iso(weekStart);
+ const ref=doc(db,"schedules",weekKey);
+ // Collect ALL 6 days in one pass. Mobile and desktop inputs are mirrored,
+ // so changing any day/period is included in this single weekly write.
+ const schedule=collectScheduleFromUI();
+ try {
+  setSyncStatus("saving","Đang lưu...");
+  await setDoc(ref,{
+   weekStart:weekKey,
+   schedule,
+   updatedAt:serverTimestamp(),
+   updatedBy:uid,
+   updatedByName:profile?.displayName||user.displayName||"Học sinh"
+  },{merge:true});
+  // Keep local UI responsive; the realtime listener remains the source of truth.
+  if(user?.uid===uid && iso(weekStart)===weekKey){
+   currentSchedule=schedule;
+   applyScheduleToUI();
+  }
+  scheduleDirty=false;
+  setSyncStatus("online","Đang đồng bộ");
+  toast("✓ Đã cập nhật TKB chung");
+ } catch(e) {
+  console.error("saveSchedule failed:",e);
+  setSyncStatus("error","Lưu thất bại");
+  toast(`Lưu TKB thất bại: ${errorMessage(e)}`);
+  throw e;
+ }
+}
+
+async function loadScheduleForCurrentWeek(){
+ // Kept for compatibility with existing callers; realtime listener handles live updates.
+ if(!user)return {};
+ const weekKey=iso(weekStart);
+ const s=await getDoc(doc(db,"schedules",weekKey));
+ if(iso(weekStart)!==weekKey)return currentSchedule;
+ currentSchedule=s.exists()?(s.data().schedule||{}):{};
+ applyScheduleToUI();
+ return currentSchedule;
+}
+function renderScheduleTaskDropdowns(){
+ $$(".schedule-task-select").forEach(sel=>{
+   const date=sel.dataset.taskDate, p=sel.dataset.taskPeriod;
+   const subject=currentSchedule[dayFromDate(date)]?.[p]||"";
+   const matching=tasks.filter(t=>t.date===date&&t.period===p&&(!subject||t.subject===subject));
+   sel.innerHTML=`<option value="">${matching.length?`📋 ${matching.length} nhiệm vụ`:`📋 Chưa có nhiệm vụ`}</option>`+matching.map(t=>`<option value="${escape(t.id)}">${escape(t.taskContent)} · ${Number(t.points||0)}đ</option>`).join("");
+ });
+}
+function scheduleSubjectsForDate(date){
+ const day=dayFromDate(date),row=currentSchedule[day]||{};
+ return [...new Set(PERIODS.map(p=>row[p[0]]).filter(Boolean))];
+}
+async function loadScheduleForDate(date){
+ const key=weekKeyForDate(date);
+ if(key===iso(weekStart))return currentSchedule;
+ const s=await getDoc(doc(db,"schedules",key));
+ return s.exists()?(s.data().schedule||{}):{};
+}
+async function syncTaskDropdown(){
+ const date=$("#taskDate").value||iso(new Date()),day=dayFromDate(date),schedule=await loadScheduleForDate(date),row=schedule[day]||{};
+ const subjects=[...new Set(PERIODS.map(p=>row[p[0]]).filter(Boolean))],previous=$("#taskSubject").value,list=subjects.length?subjects:SUBJECTS;
+ $("#taskSubject").innerHTML=subjectOptions(previous,list);
+ if(!$("#taskSubject").value)$("#taskSubject").value=list[0]||"";
+ updateTaskDialogState(subjects.length);syncTaskPeriods(schedule);
+}
+function syncTaskPeriods(scheduleOverride=null){
+ const date=$("#taskDate").value||iso(new Date()),subject=$("#taskSubject").value,day=dayFromDate(date);
+ const schedule=scheduleOverride||currentSchedule,row=schedule[day]||{};
+ const matches=PERIODS.filter(p=>row[p[0]]===subject);
+ const list=matches.length?matches:PERIODS;
+ const previous=$("#taskPeriod").value;
+ $("#taskPeriod").innerHTML=list.map(p=>`<option value="${escape(p[0])}" ${p[0]===previous?"selected":""}>${p[3]} • Tiết ${p[4]} (${p[1]}–${p[2]})</option>`).join("");
+ if(!$("#taskPeriod").value&&list[0])$("#taskPeriod").value=list[0][0];
+}
+
+function fillSubjects(){
+ $("#subjectFilter").innerHTML=`<option value="all">Tất cả môn</option>`+SUBJECTS.map(s=>`<option value="${escape(s)}">${escape(s)}</option>`).join("");
+ return syncTaskDropdown();
+}
+async function loadUsers(){
+ try{
+  const snap=await getDocs(query(collection(db,"users"),orderBy("displayName")));
+  users=snap.docs.map(d=>({id:d.id,...d.data()}));
+  $("#userFilter").innerHTML=`<option value="all">Tất cả người dùng</option>`+users.map(u=>`<option value="${escape(u.uid)}">${escape(u.displayName||u.email||"Học sinh")}</option>`).join("");
+  syncQuickUserChips();
+ }catch(e){console.warn(e);}
+}
+async function loadTasks(){
+ const snap=await getDocs(query(collection(db,"tasks"),orderBy("date","asc")));
+ tasks=snap.docs.map(d=>({id:d.id,...d.data()}));
+ tasksLoaded=true;
+ taskSnapshotResolve?.();
+ renderTasks();renderScheduleTaskDropdowns();updateTaskBadge();checkUpcomingNotifications(true);
+}
+function subscribeRealtime(){
+ // One shared realtime lifecycle. Schedule is subscribed here once; week navigation replaces only its schedule listener.
+ subscribeScheduleRealtime(iso(weekStart),scheduleRenderToken);
+ unsubs.push(onSnapshot(query(collection(db,"tasks"),orderBy("date","asc")),snap=>{
+   tasks=snap.docs.map(d=>({id:d.id,...d.data()}));
+   tasksLoaded=true;
+   taskSnapshotResolve?.();
+   renderTasks();renderScheduleTaskDropdowns();updateTaskBadge();checkUpcomingNotifications();
+ },e=>console.warn("task listener",e)));
+ unsubs.push(onSnapshot(query(collection(db,"users"),orderBy("displayName")),snap=>{
+   users=snap.docs.map(d=>({id:d.id,...d.data()}));
+   $("#userFilter").innerHTML=`<option value="all">Tất cả người dùng</option>`+users.map(u=>`<option value="${escape(u.uid)}">${escape(u.displayName||u.email||"Học sinh")}</option>`).join("");
+   if($( "#leaderboardTab").classList.contains("active"))leaderboard().catch(()=>{});
+ },e=>console.warn("users listener",e)));
+ unsubs.push(onSnapshot(doc(db,"users",user.uid),snap=>{
+   if(snap.exists()){ profile=snap.data(); updateProfileUI(); }
+ },e=>console.warn("profile listener",e)));
+}
+function unsubscribeRealtime(){
+ unsubscribeScheduleRealtime();
+ unsubs.forEach(fn=>{try{fn()}catch{}});
+ unsubs=[];
+}
+function createdAtMillis(t){const v=t?.createdAt;return v?.toMillis?.()??(v?.seconds?Number(v.seconds)*1000:Number(v)||0)}
+function isPeriodEnded(t){const row=periodByKey(t?.period);if(!t?.date||!row)return false;const d=localDate(t.date),[h,m]=String(row[2]||"23:59").split(":").map(Number);d.setHours(h||0,m||0,0,0);return Date.now()>d.getTime()}
+function filteredTasks(){
+ const today=iso(new Date()),now=Date.now(),uf=$("#userFilter").value,sf=$("#subjectFilter").value,q=$("#search").value.trim().toLowerCase();
+ return tasks.filter(t=>{
+  const done=(t.completedBy||[]).includes(user.uid),periodEnded=isPeriodEnded(t),overdue=!done&&periodEnded;
+  const periodMatch=period==="current"?!done&&!periodEnded:done;
+  const statusMatch=statusFilter==="all"?true:statusFilter==="minePending"?!done&&!periodEnded&&t.date>=today:statusFilter==="overdue"?overdue:done;
+  const periodStatusMatch=statusFilter==="overdue"?overdue:periodMatch;
+  return periodStatusMatch&&statusMatch&&(uf==="all"||t.createdBy===uf)&&(sf==="all"||t.subject===sf)&&(!q||`${t.subject} ${t.taskContent} ${t.description||""}`.toLowerCase().includes(q));
+ }).sort((a,b)=>{
+  const dateDiff=b.date.localeCompare(a.date);if(dateDiff)return dateDiff;
+  return PERIODS.findIndex(p=>p[0]===a.period)-PERIODS.findIndex(p=>p[0]===b.period)||createdAtMillis(b)-createdAtMillis(a);
+ });
+}
+function renderTasks(){
+ updateTaskBadge();
+ if(!tasksLoaded){
+  if(period==="current"){$("#taskArea").innerHTML=`<div class="task-loading" aria-live="polite" aria-label="Đang tải nhiệm vụ">${Array.from({length:4},()=>`<div class="task-skeleton"></div>`).join("")}</div>`;return}
+  $("#taskArea").innerHTML=`<div class="task-loading" aria-live="polite" aria-label="Đang tải nhiệm vụ">${Array.from({length:3},()=>`<div class="task-skeleton"></div>`).join("")}</div>`;return
+ }
+ const list=filteredTasks();
+ const focusTomorrow=tomorrowTaskFocusPending;
+ const tomorrow=new Date();tomorrow.setDate(tomorrow.getDate()+1);const tomorrowKey=iso(tomorrow),hasTomorrow=list.some(t=>t.date===tomorrowKey);
+ if(tomorrowTaskFocusPending){tomorrowTaskFocusPending=false;requestAnimationFrame(()=>{const el=document.querySelector(`[data-task-day="${tomorrowKey}"]`);if(el)el.scrollIntoView({behavior:"smooth",block:"start"})})}
+ if(focusTomorrow&&!hasTomorrow){
+  const hint=`<div class="empty tomorrow-empty-hint"><i class="fa-regular fa-calendar"></i><strong>Ngày mai chưa có nhiệm vụ</strong><span>Bạn có thể tạo nhiệm vụ mới cho ngày mai.</span></div>`;
+  if(!list.length){$("#taskArea").innerHTML=hint;return}
+  if(view!=="list")$("#taskArea").innerHTML=hint;
+ }
+ if(!list.length){$("#taskArea").innerHTML=`<div class="empty"><i class="fa-regular fa-circle-check"></i><strong>Chưa có nhiệm vụ</strong><span>Hãy tạo nhiệm vụ đầu tiên hoặc đổi bộ lọc.</span></div>`;return}
+ if(view==="list"){renderList(list);return}
+ const groups={};list.forEach(t=>(groups[t.date]??=[]).push(t));
+ const dates=Object.keys(groups).sort((a,b)=>b.localeCompare(a));
+ const html=dates.map(date=>`<div class="day" data-task-day="${escape(date)}"><div class="day-head"><div><strong>📌 ${localDate(date).toLocaleDateString("vi-VN",{weekday:"long",day:"2-digit",month:"2-digit",year:"numeric"})}</strong><small>${groups[date].length} nhiệm vụ</small></div><span>${groups[date].filter(t=>(t.completedBy||[]).includes(user.uid)).length}/${groups[date].length} hoàn thành</span></div>${groups[date].map(taskHtml).join("")}</div>`).join("");
+ if(period==="past"&&statusFilter==="all"){
+  const overdue=tasks.filter(t=>{const done=(t.completedBy||[]).includes(user.uid);return !done&&isPeriodEnded(t)}).filter(t=>(uf==="all"||t.createdBy===uf)&&(sf==="all"||t.subject===sf)&&(!q||`${t.subject} ${t.taskContent} ${t.description||""}`.toLowerCase().includes(q))).sort((a,b)=>b.date.localeCompare(a.date)||PERIODS.findIndex(p=>p[0]===a.period)-PERIODS.findIndex(p=>p[0]===b.period));
+  const done= list.filter(t=>(t.completedBy||[]).includes(user.uid));
+  $("#taskArea").innerHTML=`${overdue.length?`<div class="task-section-title">⚠️ Quá hạn (chưa làm)<span>${overdue.length}</span></div>${renderTaskGroupsHtml(overdue)}`:""}${done.length?`<div class="task-section-title">✅ Đã hoàn thành<span>${done.length}</span></div>${renderTaskGroupsHtml(done)}`:""}`||`<div class="empty"><i class="fa-regular fa-circle-check"></i><strong>Chưa có nhiệm vụ đã qua</strong><span>Nhiệm vụ đã hoàn thành sẽ xuất hiện tại đây.</span></div>`;
+ }else $("#taskArea").innerHTML=(focusTomorrow&&!hasTomorrow?`<div class="empty tomorrow-empty-hint"><i class="fa-regular fa-calendar"></i><strong>Ngày mai chưa có nhiệm vụ</strong><span>Bạn có thể tạo nhiệm vụ mới cho ngày mai.</span></div>`:"")+html;
+}
+function renderTaskGroupsHtml(list){const groups={};list.forEach(t=>(groups[t.date]??=[]).push(t));return Object.keys(groups).sort((a,b)=>b.localeCompare(a)).map(date=>`<div class="day" data-task-day="${escape(date)}"><div class="day-head"><div><strong>📌 ${localDate(date).toLocaleDateString("vi-VN",{weekday:"long",day:"2-digit",month:"2-digit",year:"numeric"})}</strong><small>${groups[date].length} nhiệm vụ</small></div><span>${groups[date].filter(t=>(t.completedBy||[]).includes(user.uid)).length}/${groups[date].length} hoàn thành</span></div>${groups[date].map(taskHtml).join("")}</div>`).join("")}
+function renderList(list){$("#taskArea").innerHTML=`<div class="day">${list.map(taskHtml).join("")}</div>`}
+function taskHtml(t){
+ const mine=t.createdBy===user.uid,done=(t.completedBy||[]).includes(user.uid),q=$("#search")?.value.trim()||"",diff=taskDeadlineDate(t)-Date.now(),deadlineIcon=diff<0?"⚠️":diff<=86400000?"⏰":"📅";
+ return `<article class="task" data-task-card="${escape(t.id)}"><div class="task-time"><b>${escape((t.period||"").replace("Sáng - ","Sáng • ").replace("Chiều - ","Chiều • "))}</b><small>${escape(t.startTime||"")}–${escape(t.endTime||"")}</small></div><div class="subject-pill">${escape(t.subject)}</div><div class="task-main"><div class="task-title ${done?"completed":""}">${highlightText(t.taskContent,q)}</div><div class="task-deadline ${deadlineClass(t)}">${deadlineIcon} Hạn: ${formatDeadline(t)} · ${taskTimeLabel(t)}</div><div class="author">${Number(t.points||0)} điểm${t.description?` · ${escape(t.description)}`:""}${t.authorName?` · 👤 ${escape(t.authorName)}`:""}</div></div><button class="complete" data-complete="${escape(t.id)}" aria-label="Đánh dấu hoàn thành nhiệm vụ ${escape(t.taskContent)}" ${done?"disabled":""}>${done?"✓ Đã xong":"Hoàn thành"}</button>${mine?`<button class="icon delete" title="Xóa" aria-label="Xóa nhiệm vụ ${escape(t.taskContent)}" data-delete="${escape(t.id)}"><i class="fa-solid fa-trash"></i></button>`:""}</article>`;
+}
+async function createTask(){
+ if(!user)throw new Error("Bạn chưa đăng nhập. Hãy đăng nhập rồi tạo nhiệm vụ.");
+ const date=$("#taskDate").value,p=$("#taskPeriod").value,subject=$("#taskSubject").value,deadline=$("#deadline").value,content=$("#taskContent").value.trim(),points=Number($("#taskPoints").value);
+ const row=periodByKey(p);
+ if(!date||!subject||!row||!content)throw new Error("Vui lòng chọn đủ ngày, môn, tiết và nhập nhiệm vụ.");
+ const schedule=await loadScheduleForDate(date),day=dayFromDate(date);
+ if(scheduleHasDayData(schedule,day)&&schedule[day]?.[p]!==subject)throw new Error("Môn học không khớp với thời khóa biểu chung của ngày/tiết này.");
+ if(!deadline)throw new Error("Vui lòng chọn hạn nộp.");
+ await addDoc(collection(db,"tasks"),{createdBy:user.uid,authorName:profile?.displayName||user.displayName||"Học sinh",subject,taskContent:content,date,dayOfWeek:day,period:p,startTime:row[1],endTime:row[2],deadline:new Date(deadline).toISOString(),description:$("#taskDescription").value.trim(),points,status:"pending",completedBy:[],completedAt:null,createdAt:serverTimestamp()});
+ closeTaskModal();$("#taskForm").reset();setTaskDefaults();toast("Đã tạo nhiệm vụ — mọi người sẽ thấy ngay");checkUpcomingNotifications(true);
+}
+async function completeTask(id){
+ const meta=await runTransaction(db,async tx=>{
+  const ref=doc(db,"tasks",id),snap=await tx.get(ref);if(!snap.exists())throw new Error("not-found");
+  const t=snap.data(),completed=t.completedBy||[];if(completed.includes(user.uid))return null;
+  const now=new Date(),deadline=new Date(t.deadline),onTime=now<=deadline,points=Number(t.points||0),uref=doc(db,"users",user.uid),us=await tx.get(uref),u=us.data()||{},today=iso(now),yesterday=iso(new Date(now.getTime()-86400000)),previousStreak=Number(u.streak||0),previousLast=u.lastCompletedDate||"";
+  let streak=previousStreak;if(previousLast===today)streak=Math.max(1,previousStreak);else if(previousLast===yesterday)streak=previousStreak+1;else streak=1;
+  tx.update(ref,{completedBy:arrayUnion(user.uid),completedAt:serverTimestamp(),status:"completed"});
+  tx.update(uref,{...(onTime?{points:Number(u.points||0)+points,weeklyPoints:Number(u.weeklyPoints||0)+points,tasksCompleted:Number(u.tasksCompleted||0)+1}:{}),streak,lastCompletedDate:today});
+  return {id,onTime,points,completionDate:today,previousStreak,previousLast,newStreak:streak};
+ });
+ if(!meta)return;lastCompletionUndo=meta;await loadProfile();await loadTasks();toast("Đã hoàn thành nhiệm vụ",{actionText:"Hoàn tác",duration:5000,onAction:()=>undoCompleteTask(id)});
+}
+async function undoCompleteTask(id){
+ const meta=lastCompletionUndo?.id===id?lastCompletionUndo:null;if(!meta)throw new Error("Không còn thao tác để hoàn tác.");
+ await runTransaction(db,async tx=>{
+  const ref=doc(db,"tasks",id),snap=await tx.get(ref);if(!snap.exists())throw new Error("Nhiệm vụ không còn tồn tại.");
+  const t=snap.data(),completed=t.completedBy||[];if(!completed.includes(user.uid))return;
+  const uref=doc(db,"users",user.uid),us=await tx.get(uref),u=us.data()||{},taskUpdate={completedBy:arrayRemove(user.uid),completedAt:null,status:"pending"},userUpdate={};
+  if(meta.onTime){userUpdate.points=Math.max(0,Number(u.points||0)-meta.points);userUpdate.weeklyPoints=Math.max(0,Number(u.weeklyPoints||0)-meta.points);userUpdate.tasksCompleted=Math.max(0,Number(u.tasksCompleted||0)-1)}
+  if(u.lastCompletedDate===meta.completionDate&&Number(u.streak||0)===meta.newStreak){userUpdate.streak=meta.previousStreak;userUpdate.lastCompletedDate=meta.previousLast||""}
+  tx.update(ref,taskUpdate);if(Object.keys(userUpdate).length)tx.update(uref,userUpdate);
+ });
+ lastCompletionUndo=null;await loadProfile();await loadTasks();toast("↩ Đã hoàn tác nhiệm vụ");
+}
+async function deleteTask(id){if(!confirm("Xóa nhiệm vụ này?"))return;await deleteDoc(doc(db,"tasks",id));await loadTasks();toast("Đã xóa nhiệm vụ")}
+
+function updateProfileUI(){
+ $("#headerName").textContent=profile?.displayName||"Học sinh";$("#profileName").textContent=profile?.displayName||"Học sinh";$("#profileEmail").textContent=profile?.email||user?.email||"";$("#avatar").textContent=initials(profile?.displayName||"HS");
+ $("#profileDisplay").value=profile?.displayName||"";$("#profileClass").value=profile?.className||"";$("#points").textContent=profile?.points||0;$("#weekly").textContent=profile?.weeklyPoints||0;$("#completed").textContent=profile?.tasksCompleted||0;$("#streak").textContent=profile?.streak||0;
+}
+async function loadProfile(){
+ const s=await getDoc(doc(db,"users",user.uid));profile=s.data()||{displayName:user.email?.split("@")[0]||"Học sinh",className:"",points:0,weeklyPoints:0,tasksCompleted:0,streak:0,lastCompletedDate:""};updateProfileUI();
+}
+async function saveProfile(){const name=$("#profileDisplay").value.trim(),cls=$("#profileClass").value.trim();await updateDoc(doc(db,"users",user.uid),{displayName:name,className:cls});await loadProfile();await loadUsers();toast("Đã cập nhật hồ sơ")}
+async function leaderboard(){const snap=await getDocs(query(collection(db,"users"),orderBy("weeklyPoints","desc"))),top=snap.docs.map(d=>d.data()).slice(0,10);$("#ranking").innerHTML=top.length?top.map((u,i)=>`<div class="rank"><strong>#${i+1}</strong><span>${escape(u.displayName||"Học sinh")} <small class="muted">${escape(u.className||"")}</small></span><span>${u.tasksCompleted||0} nhiệm vụ</span><strong>${u.weeklyPoints||0} điểm</strong></div>`).join(""):`<div class="empty"><i class="fa-regular fa-chart-bar"></i><strong>Chưa có dữ liệu xếp hạng</strong><span>Hãy hoàn thành nhiệm vụ để bắt đầu.</span></div>`}
+function setTaskDefaults(){const d=iso(new Date());lastDefaultDeadline=defaultDeadlineForDate(d);$("#taskDate").value=d;$("#deadline").value=lastDefaultDeadline;syncTaskDropdown().catch(()=>{});$("#taskPoints").value=10}
+function switchTab(name){const current=$(".nav.active")?.dataset.tab;if(current!==name&&scheduleDirty&&!confirm("Bạn có thay đổi chưa lưu. Tiếp tục?"))return false;$$('.nav').forEach(b=>b.classList.toggle('active',b.dataset.tab===name));$$('.tab').forEach(s=>s.classList.toggle('active',s.id===name+'Tab'));if(name==='leaderboard')leaderboard().catch(e=>toast(errorMessage(e)));return true}
+
+$("#googleLogin").onclick=async()=>{clearAuthError();const btn=$("#googleLogin");btn.disabled=true;btn.innerHTML='<i class="fa-brands fa-google"></i> Đang đăng nhập...';try{await signInWithPopup(auth,provider)}catch(x){console.error("Firebase Google login error:",x);showAuthError(errorMessage(x))}finally{btn.disabled=false;btn.innerHTML='<i class="fa-brands fa-google"></i> Đăng nhập bằng Google'}};
+$("#logout").onclick=()=>signOut(auth);
+$$('.nav').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
+$("#notificationBtn")?.addEventListener("click",()=>notificationPanelOpen?closeNotifications():openNotifications());
+$("#closeNotifications")?.addEventListener("click",closeNotifications);
+$("#enableDesktopNotifications")?.addEventListener("click",()=>enableDesktopNotifications().catch(e=>toast(errorMessage(e))));
+$("#notificationList")?.addEventListener("click",e=>{const b=e.target.closest("[data-notification-task]");if(!b)return;const t=tasks.find(x=>x.id===b.dataset.notificationTask);if(t){closeNotifications();if(!switchTab("tasks"))return;setTimeout(()=>{const card=document.querySelector(`[data-task-card="${CSS.escape(t.id)}"]`);if(!card)return;if((t.completedBy||[]).includes(user.uid)){card.classList.add("pulse-highlight");setTimeout(()=>card.classList.remove("pulse-highlight"),2000)}else card.scrollIntoView({behavior:"smooth",block:"center"})},80)}});
+document.addEventListener("click",e=>{if(notificationPanelOpen&&!e.target.closest("#notificationPanel,#notificationBtn"))closeNotifications()});
+function changeWeek(action){if(scheduleDirty&&!confirm("Bạn có thay đổi chưa lưu. Tiếp tục?"))return;action();scheduleDirty=false;renderSchedule();if(user)subscribeScheduleRealtime(iso(weekStart),scheduleRenderToken)}
+$("#prevWeek").onclick=()=>changeWeek(()=>weekStart.setDate(weekStart.getDate()-7));
+$("#nextWeek").onclick=()=>changeWeek(()=>weekStart.setDate(weekStart.getDate()+7));
+$("#thisWeek").onclick=()=>changeWeek(()=>weekStart=monday(new Date()));
+document.addEventListener("change",e=>{const input=e.target.closest?.(".schedule-input");if(input)syncScheduleInputGroup(input)});
+$("#saveSchedule").onclick=()=>saveSchedule().catch(e=>toast(errorMessage(e)));
+function openTaskModal(){taskDialogReturnFocus=$("#newTask");$("#taskModal").classList.remove("hidden");document.body.classList.add("modal-open");setTaskDefaults();setTimeout(()=>$("#taskDate")?.focus(),0)}
+function closeTaskModal(){const modal=$("#taskModal");if(!modal)return;modal.classList.add("hidden");document.body.classList.remove("modal-open");taskDialogReturnFocus?.focus();taskDialogReturnFocus=null}
+$("#newTask").onclick=openTaskModal;
+$("#closeDialog").onclick=closeTaskModal;$("#cancelDialog").onclick=closeTaskModal;
+$("#taskModal").addEventListener("click",e=>{if(e.target.id==="taskModal")closeTaskModal()});
+$("#taskForm").onsubmit=e=>{e.preventDefault();createTask().catch(x=>toast(errorMessage(x)))};
+$("#taskDate").onchange=()=>{const date=$("#taskDate").value;if(!date)return;const next=defaultDeadlineForDate(date),deadline=$("#deadline").value;if(!deadline||deadline===lastDefaultDeadline){$("#deadline").value=next;lastDefaultDeadline=next}syncTaskDropdown().catch(e=>toast(errorMessage(e)))};
+$("#taskSubject").onchange=()=>syncTaskPeriods();
+["userFilter","subjectFilter"].forEach(id=>$("#"+id).onchange=()=>{if(id==="userFilter")syncQuickUserChips();renderTasks()});
+$("#search").oninput=()=>{const clear=$("#clearSearch");clear?.classList.toggle("hidden",!$("#search").value);clearTimeout(searchTimer);searchTimer=setTimeout(renderTasks,180)};
+$("#clearSearch")?.addEventListener("click",()=>{$("#search").value="";$("#clearSearch").classList.add("hidden");renderTasks();$("#search").focus()});
+$$('.seg button').forEach(b=>b.onclick=()=>{$$('.seg button').forEach(x=>x.classList.toggle('active',x===b));view=b.dataset.view;renderTasks()});
+$$('.subtabs button').forEach(b=>b.onclick=()=>{$$('.subtabs button').forEach(x=>x.classList.toggle('active',x===b));period=b.dataset.period;renderTasks()});
+$$('[data-status-filter]').forEach(b=>b.onclick=()=>{$$('[data-status-filter]').forEach(x=>x.classList.toggle('active',x===b));statusFilter=b.dataset.statusFilter;renderTasks()});
+$$('[data-user-quick]').forEach(b=>b.onclick=()=>{$("#userFilter").value=b.dataset.userQuick==="self"?user.uid:"all";syncQuickUserChips();renderTasks()});
+$("#taskArea").onclick=e=>{const c=e.target.closest('[data-complete]'),d=e.target.closest('[data-delete]');if(c&&!c.disabled)completeTask(c.dataset.complete).catch(x=>toast(errorMessage(x)));if(d)deleteTask(d.dataset.delete).catch(x=>toast(errorMessage(x)))};
+$("#profileForm").onsubmit=e=>{e.preventDefault();saveProfile().catch(x=>toast(errorMessage(x)))};
+$("#refreshRank")?.addEventListener("click",()=>leaderboard().catch(e=>toast(errorMessage(e))));
+$("#mobileDaySelector")?.addEventListener("click",e=>{const b=e.target.closest("[data-mobile-day]");if(!b)return;mobileDayIndex=Number(b.dataset.mobileDay);renderMobileSchedule();renderScheduleTaskDropdowns()});
+window.addEventListener("online",updateOnlineStatus);window.addEventListener("offline",updateOnlineStatus);updateOnlineStatus();notificationTimer=setInterval(()=>checkUpcomingNotifications(),60000);
+
+onAuthStateChanged(auth,async u=>{
+ user=u;
+ if(u){
+  tasksLoaded=false;
+  taskSnapshotPromise=new Promise(resolve=>{taskSnapshotResolve=resolve});
+  scheduleDirty=false;clearAuthError();$("#auth").classList.add('hidden');$("#app").classList.remove('hidden');$("#headerName").textContent=u.displayName||u.email||"";
+  try{
+   const userRef=doc(db,"users",u.uid),existing=await getDoc(userRef);
+   if(!existing.exists())await setDoc(userRef,{uid:u.uid,email:u.email||"",displayName:u.displayName||u.email?.split('@')[0]||"Học sinh",className:"",points:0,weeklyPoints:0,tasksCompleted:0,streak:0,lastCompletedDate:"",createdAt:serverTimestamp()});
+   await loadProfile();
+   fillSubjects();
+   await syncTaskDropdown().catch(()=>{});
+   prepareEveningScheduleView();
+   tomorrowTaskFocusPending=new Date().getHours()>=18;
+   renderSchedule();
+   subscribeRealtime();
+   await Promise.all([loadUsers(),loadTasks(),taskSnapshotPromise]);
+   hideAppLoader();
+  }catch(e){console.error("Firebase init error:",e);toast(errorMessage(e));hideAppLoader()}
+ }else{
+  tasksLoaded=false;tasks=[];users=[];profile=null;taskSnapshotResolve=null;taskSnapshotPromise=null;
+  scheduleDirty=false;notificationLastSnapshot="";if(notificationPanelOpen)closeNotifications();scheduleRenderToken++;unsubscribeRealtime();$("#auth").classList.remove('hidden');$("#app").classList.add('hidden');clearAuthError();
+  setTimeout(hideAppLoader,300);
+ }
+});

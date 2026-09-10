@@ -1,0 +1,32 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && request.auth.uid == uid;
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    // ONE shared schedule per week. Any signed-in user may update it;
+    // everyone reads the same document.
+    match /schedules/{weekId} {
+      allow read, create, update: if signedIn();
+      allow delete: if signedIn();
+    }
+
+    match /tasks/{taskId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.createdBy == request.auth.uid;
+      allow update: if signedIn();
+      allow delete: if signedIn() && resource.data.createdBy == request.auth.uid;
+    }
+
+    match /rankings/{weekId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+  }
+}
